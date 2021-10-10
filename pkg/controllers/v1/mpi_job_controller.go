@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	corev1 "k8s.io/api/core/v1"
@@ -811,47 +813,77 @@ func (c *MPIJobController) getLauncherRoleBinding(mpiJob *kubeflow.MPIJob) (*rba
 // getOrCreateWorker gets the worker Pod controlled by this
 // MPIJob, or creates one if it doesn't exist.
 func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1.Pod, error) {
-	var (
-		workerPrefix   string        = mpiJob.Name + workerSuffix
-		workerPods     []*corev1.Pod = []*corev1.Pod{}
-		i              int32         = 0
-		workerReplicas *int32
-	)
-	if worker, ok := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]; ok && worker != nil {
-		workerReplicas = worker.Replicas
-	} else {
-		return workerPods, nil
-	}
-
-	// Remove Pods when replicas are scaled down
 	selector, err := workerSelector(mpiJob.Name)
 	if err != nil {
 		return nil, err
 	}
-	podFullList, err := c.podLister.List(selector)
+	podList, err := c.podLister.List(selector)
 	if err != nil {
 		return nil, err
 	}
-	if len(podFullList) > int(*workerReplicas) {
-		for _, pod := range podFullList {
-			indexStr, ok := pod.Labels[common.ReplicaIndexLabel]
-			if !ok {
-				return nil, err
-			}
-			index, err := strconv.Atoi(indexStr)
-			if err == nil {
-				if index >= int(*workerReplicas) {
-					err = c.kubeClient.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
+
+	var existMaxIdx int = -1
+	podNameMap := map[int]string
+	for _, pod := range podList {
+		if pod.GetLabels() == nil {
+			return nil, fmt.Errorf("pod %s/%s has no label", pod.GetNamespace(), pod.GetName())
+		}
+		indexStr, ok := pod.Labels[common.ReplicaIndexLabel]
+		if !ok {
+			return nil, fmt.Errorf("cannot find key %s in labels of pod %s/%s",
+				common.ReplicaIndexLabel, pod.GetNamespace(), pod.GetName())
+		}
+		index, converr := strconv.Atoi(indexStr)
+		if converr != nil {
+			return nil, fmt.Errorf("failed convert index string %s: %s", indexStr, err.Error())
+		}
+		duplicatedPodName, exist := podNameMap[index]
+		if exist {
+			return nil, fmt.Errorf("found multiple pod with same index %d, %s & %s",
+				index, duplicatedPodName, pod.GetName())
+		}
+
+		podNameMap[index] = pod.GetName()
+		if index > existMaxIdx {
+			existMaxIdx = index
 		}
 	}
 
-	for ; i < *workerReplicas; i++ {
-		name := fmt.Sprintf("%s-%d", workerPrefix, i)
+	var (
+		workerPrefix   string        = mpiJob.Name + workerSuffix
+		workerPods     []*corev1.Pod = []*corev1.Pod{}
+		workerReplicas int
+	)
+	if worker, ok := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]; ok && worker != nil {
+		workerReplicas = int(*worker.Replicas)
+		if workerReplicas == 0 {
+			return nil, fmt.Errorf("cannot set replicas for Worker to be ZERO")
+		}
+	} else {
+		return workerPods, nil
+	}
+
+	// When deleting redundant pods, pod with max index is kept
+	for idx, name := range podNameMap {
+		if len(podNameMap) <= workerReplicas {
+			break
+		}
+		if idx == existMaxIdx {
+			continue
+		}
+		err = c.kubeClient.CoreV1().Pods(mpiJob.Namespace).Delete(name, &metav1.DeleteOptions{})
+		if err != nil {
+			return nil, err
+		}
+		delete(podNameMap, idx)
+	}
+
+	for increment := 1; len(podNameMap) < workerReplicas; increment++ {
+		idx := existMaxIdx + increment
+		podNameMap[idx] = fmt.Sprintf("%s-%d", workerPrefix, idx)
+	}
+
+	for i, name := range podNameMap {
 		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(name)
 
 		// If the worker Pod doesn't exist, we'll create it.
@@ -888,19 +920,20 @@ func (c *MPIJobController) getOrCreateWorker(mpiJob *kubeflow.MPIJob) ([]*corev1
 }
 
 func (c *MPIJobController) deleteWorkerPods(mpiJob *kubeflow.MPIJob) error {
-	var (
-		workerPrefix   string = mpiJob.Name + workerSuffix
-		i              int32  = 0
-		workerReplicas *int32
-	)
-	if worker, ok := mpiJob.Spec.MPIReplicaSpecs[kubeflow.MPIReplicaTypeWorker]; ok && worker != nil {
-		workerReplicas = worker.Replicas
-	} else {
-		return nil
+	selector := labels.SelectorFromValidatedSet(labels.Set{
+		labelGroupName:   "kubeflow.org",
+		labelMPIJobName:  mpiJob.Name,
+		labelMPIRoleType: worker,
+	})
+
+	workerPodsList, err := c.podLister.List(selector)
+
+	if err != nil {
+		return err
 	}
 
-	for ; i < *workerReplicas; i++ {
-		name := fmt.Sprintf("%s-%d", workerPrefix, i)
+	for idx := range workerPodsList {
+		name := workerPodsList[idx].GetName()
 		pod, err := c.podLister.Pods(mpiJob.Namespace).Get(name)
 
 		// If the worker Pod doesn't exist, we'll create it.
